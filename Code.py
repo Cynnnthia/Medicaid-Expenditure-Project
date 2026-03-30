@@ -4,7 +4,7 @@ years = range(2013, 2025)
 data = []
 
 for year in years:
-    f"../data/FY_{year}_MFCU_Statistical_Chart.xlsx"
+    file_path = f"../data/FY_{year}_MFCU_Statistical_Chart.xlsx"
     
     df = pd.read_excel(file_path)
     
