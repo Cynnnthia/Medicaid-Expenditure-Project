@@ -1,23 +1,42 @@
 import pandas as pd
 
-years = range(2013, 2025)
-data = []
+# use yearly data to generate monthly data in monetary form without scientific notation
 
-for year in years:
-    file_path = f"../data/FY_{year}_MFCU_Statistical_Chart.xlsx"
-    
-    df = pd.read_excel(file_path)
-    
-    # Find California
-    CA_row = df[df["State"] == "California"]
-    exp = CA_row["Total Medicaid Expenditures"].values[0]
-    
-    # Clean data
-    exp = str(exp).replace("$", "").replace(",", "")
-    exp = float(exp)
-    
-    data.append([year, exp])
+# Yearly data
+data = {
+    "Year": list(range(2013, 2026)),
+    "Expenditure": [
+        6.605676e+10, 6.824844e+10, 9.061436e+10, 8.660858e+10,
+        8.866459e+10, 8.889577e+10, 9.410041e+10, 1.038866e+11,
+        1.156904e+11, 1.250178e+11, 1.301333e+11, 1.570981e+11,
+        1.734027e+11
+    ]
+}
 
-ca_df = pd.DataFrame(data, columns=["Year", "Expenditure"])
+df = pd.DataFrame(data)
 
-print(ca_df)
+df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-01-01")
+df.set_index("Date", inplace=True)
+
+monthly_index = pd.date_range(start="2013-01-01", end="2025-12-01", freq="MS")
+
+df = df.reindex(df.index.union(monthly_index))
+
+df = df.sort_index()
+df["Expenditure"] = df["Expenditure"].interpolate(method="linear")
+
+# only keep the monthly data
+monthly_df = df.loc[monthly_index]
+
+monthly_df = monthly_df.reset_index()
+monthly_df.rename(columns={"index": "Date"}, inplace=True)
+
+# turn it to monetary form
+monthly_df["Expenditure"] = monthly_df["Expenditure"].map('${:,.0f}'.format)
+
+# print it out
+print(monthly_df.head())
+print(monthly_df.tail())
+print("Total rows:", len(monthly_df))
+
+monthly_df.to_csv("monthly_expenditure_2013_2025.csv", index=False)
