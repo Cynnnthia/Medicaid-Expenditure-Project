@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")          # non-interactive backend for file export
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.backends.backend_pdf import PdfPages
@@ -20,6 +20,13 @@ from statsmodels.tsa.seasonal import seasonal_decompose
  
 import os
 import json
+
+try:
+    from prophet import Prophet
+    HAS_PROPHET = True
+except ImportError:
+    HAS_PROPHET = False
+    print("Prophet not installed — skipping Prophet forecast.")
  
 # ─────────────────────────────────────────────
 # 0. OUTPUT DIRECTORY
@@ -52,7 +59,6 @@ print(annual_df.to_string(index=False))
 # ─────────────────────────────────────────────
 monthly_dates = pd.date_range("2013-01-01", "2025-12-01", freq="MS")
  
-# Linear model on fractional year → monthly values
 lin_model = LinearRegression()
 X_year = YEARS.reshape(-1, 1)
 lin_model.fit(X_year, VALUES)
@@ -63,11 +69,10 @@ monthly_values = lin_model.predict(monthly_frac)
 monthly_df = pd.DataFrame({
     "Date": monthly_dates,
     "Expenditure_raw": monthly_values,
-    "Expenditure": monthly_values  # numeric for modelling
+    "Expenditure": monthly_values
 })
 monthly_df.set_index("Date", inplace=True)
  
-# Save interpolated monthly CSV
 monthly_csv = monthly_df.copy()
 monthly_csv["Expenditure_fmt"] = monthly_csv["Expenditure_raw"].map("${:,.0f}".format)
 monthly_csv.to_csv(f"{OUT}/monthly_interpolated_2013_2025.csv")
@@ -83,7 +88,6 @@ print(annual_df[["Year", "Expenditure", "YoY_Growth_pct"]].to_string(index=False
 print("\n=== Summary Statistics (annual) ===")
 print(annual_df["Expenditure"].describe().apply(lambda x: f"${x:,.0f}"))
  
-# Decompose monthly series
 decomp = seasonal_decompose(monthly_df["Expenditure"], model="additive", period=12)
  
 fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
@@ -103,15 +107,13 @@ print(f"Saved: {OUT}/eda_decomposition.png")
 # ─────────────────────────────────────────────
 # 4. FORECASTING MODELS
 # ─────────────────────────────────────────────
-# ── 4a. TRAIN / TEST SPLIT on annual data ──
-SPLIT = 10   # train on first 10 years, test on last 3
+SPLIT = 10
 X_train, X_test = YEARS[:SPLIT].reshape(-1, 1), YEARS[SPLIT:].reshape(-1, 1)
 y_train, y_test = VALUES[:SPLIT], VALUES[SPLIT:]
  
-# Projection horizon
 FUTURE_YEARS = np.arange(2026, 2036)
  
-results = {}   # {model_name: {metrics, forecast_df}}
+results = {}
  
 def eval_metrics(true, pred, name):
     mae  = mean_absolute_error(true, pred)
@@ -119,6 +121,51 @@ def eval_metrics(true, pred, name):
     mape = np.mean(np.abs((true - pred) / true)) * 100
     print(f"  {name:30s} | MAE=${mae/1e9:.2f}B | RMSE=${rmse/1e9:.2f}B | MAPE={mape:.1f}%")
     return {"MAE": mae, "RMSE": rmse, "MAPE": mape}
+
+    # ─────────────────────────────────────────────
+# 4a. MODEL VALIDATION
+# ─────────────────────────────────────────────
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.stats.stattools import durbin_watson
+from sklearn.model_selection import TimeSeriesSplit
+
+print("\n=== Model Validation ===")
+
+# 1. ADF
+adf_result = adfuller(annual_df["Expenditure"])
+print(f"\n[1] ADF Stationarity Test:")
+print(f"    ADF Statistic : {adf_result[0]:.4f}")
+print(f"    p-value       : {adf_result[1]:.4f}")
+print(f"    Conclusion    : {'Non-stationary (differencing needed)' if adf_result[1] > 0.05 else 'Stationary'}")
+
+# 2. residual
+lr_all = LinearRegression().fit(YEARS.reshape(-1, 1), VALUES)
+residuals_all = VALUES - lr_all.predict(YEARS.reshape(-1, 1))
+dw_stat = durbin_watson(residuals_all)
+print(f"\n[2] Durbin-Watson Residual Test (Linear Regression):")
+print(f"    DW Statistic  : {dw_stat:.4f}")
+print(f"    Conclusion    : ", end="")
+if dw_stat < 1.5:
+    print("Positive autocorrelation in residuals")
+elif dw_stat > 2.5:
+    print("Negative autocorrelation in residuals")
+else:
+    print("No significant autocorrelation (residuals look random ✓)")
+
+# 3. stationarity
+print(f"\n[3] Time Series Cross-Validation (Linear Regression):")
+tscv = TimeSeriesSplit(n_splits=3)
+cv_maes = []
+for fold, (train_idx, test_idx) in enumerate(tscv.split(YEARS)):
+    X_cv_train = YEARS[train_idx].reshape(-1, 1)
+    X_cv_test  = YEARS[test_idx].reshape(-1, 1)
+    y_cv_train = VALUES[train_idx]
+    y_cv_test  = VALUES[test_idx]
+    lr_cv = LinearRegression().fit(X_cv_train, y_cv_train)
+    mae_cv = mean_absolute_error(y_cv_test, lr_cv.predict(X_cv_test))
+    cv_maes.append(mae_cv)
+    print(f"    Fold {fold+1}: MAE = ${mae_cv/1e9:.2f}B")
+print(f"    Average MAE : ${np.mean(cv_maes)/1e9:.2f}B")
  
  
 # ── 4b. LINEAR REGRESSION ──
@@ -158,12 +205,11 @@ results["Polynomial Regression"] = {
 try:
     arima = SARIMAX(annual_df["Expenditure"], order=(1, 1, 1), trend="t").fit(disp=False)
     test_fcast = arima.get_forecast(steps=3)
-    y_pred_arima = test_fcast.predicted_mean.values
+    y_pred_arima = np.asarray(test_fcast.predicted_mean)
     metrics_arima = eval_metrics(y_test, y_pred_arima, "ARIMA(1,1,1)")
-    # Refit on all data for projection
     arima_full = SARIMAX(VALUES, order=(1, 1, 1), trend="t").fit(disp=False)
     fcast = arima_full.get_forecast(steps=10)
-    future_arima = fcast.predicted_mean.values
+    future_arima = np.asarray(fcast.predicted_mean)
     ci = fcast.conf_int()
     results["ARIMA(1,1,1)"] = {
         "metrics": metrics_arima,
@@ -186,7 +232,6 @@ try:
         VALUES, trend="add", seasonal=None, damped_trend=True
     ).fit(optimized=True)
     future_hw = hw_full.forecast(10)
-    # Approximate CI from in-sample RMSE
     rmse_hw = np.sqrt(mean_squared_error(VALUES, hw_full.fittedvalues))
     results["Holt-Winters"] = {
         "metrics": metrics_hw,
@@ -258,6 +303,41 @@ projection_df.to_csv(f"{OUT}/projection_2026_2035.csv", index=False)
 print(f"\n=== 10-Year Projection ({best_model_name}) ===")
 print(projection_df[["Year", "Forecast ($B)", "CI Lower ($B)", "CI Upper ($B)"]].to_string(index=False))
 print(f"Saved: {OUT}/projection_2026_2035.csv")
+
+# ─────────────────────────────────────────────
+# 6b. COMPLETE DATA TABLE (历史 + 预测 汇总表)
+# ─────────────────────────────────────────────
+# 历史部分
+hist_table = pd.DataFrame({
+    "Year":          annual_df["Year"],
+    "Type":          "Historical",
+    "Expenditure ($B)": (annual_df["Expenditure"] / 1e9).round(2),
+    "CI Lower ($B)": np.nan,
+    "CI Upper ($B)": np.nan,
+    "YoY Growth (%)": annual_df["YoY_Growth_pct"].round(2),
+})
+
+# 预测部分
+proj_yoy = [np.nan] + list(
+    np.diff(best["forecast"]) / best["forecast"][:-1] * 100
+)
+proj_yoy[0] = (best["forecast"][0] - VALUES[-1]) / VALUES[-1] * 100  # 2026 vs 2025
+
+proj_table = pd.DataFrame({
+    "Year":           FUTURE_YEARS,
+    "Type":           "Forecast",
+    "Expenditure ($B)": (best["forecast"] / 1e9).round(2),
+    "CI Lower ($B)":  (best["ci_low"]    / 1e9).round(2),
+    "CI Upper ($B)":  (best["ci_high"]   / 1e9).round(2),
+    "YoY Growth (%)": np.round(proj_yoy, 2),
+})
+
+full_table = pd.concat([hist_table, proj_table], ignore_index=True)
+full_table.to_csv(f"{OUT}/full_data_table_2013_2035.csv", index=False)
+
+print("\n=== Full Data Table (2013–2035) ===")
+print(full_table.to_string(index=False))
+print(f"Saved: {OUT}/full_data_table_2013_2035.csv")
  
 # ─────────────────────────────────────────────
 # 7. VISUALIZATIONS
@@ -271,9 +351,16 @@ def fmt_billions(ax, axis="y"):
  
  
 # ── Fig 1: Historical trend ──
-fig, ax = plt.subplots(figsize=(10, 5))
+fig, ax = plt.subplots(figsize=(14, 6))
 ax.plot(annual_df["Year"], annual_df["Expenditure"] / 1e9, "o-",
         color=COLOR["hist"], linewidth=2, markersize=7, label="Historical")
+
+# 标注每年数值
+for yr, val in zip(annual_df["Year"], annual_df["Expenditure"]):
+    ax.annotate(f"${val/1e9:.1f}B", xy=(yr, val/1e9),
+                xytext=(0, 10), textcoords="offset points",
+                ha="center", fontsize=8, color=COLOR["hist"])
+
 ax.set_title("Medicaid Expenditure — Historical Trend (2013–2025)", fontsize=13)
 ax.set_xlabel("Year"); ax.set_ylabel("Expenditure ($B)")
 ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.0f}B"))
@@ -297,13 +384,27 @@ plt.savefig(f"{OUT}/fig2_yoy_growth.png", dpi=150)
 plt.close()
  
 # ── Fig 3: All model forecasts ──
-fig, ax = plt.subplots(figsize=(12, 6))
+fig, ax = plt.subplots(figsize=(14, 7))
 ax.plot(YEARS, VALUES / 1e9, "ko-", linewidth=2, markersize=7, label="Historical", zorder=5)
+
+# 历史数据标注
+for yr, val in zip(YEARS, VALUES):
+    ax.annotate(f"${val/1e9:.1f}B", xy=(yr, val/1e9),
+                xytext=(0, 10), textcoords="offset points",
+                ha="center", fontsize=7, color="black")
+
 colors_models = ["#2B6CB0", "#276749", "#C05621", "#6B46C1", "#B7791F"]
 for (name, res), col in zip(results.items(), colors_models):
-    ax.plot(FUTURE_YEARS, res["forecast"] / 1e9, "o--",
+    forecast_vals = res["forecast"] / 1e9
+    ax.plot(FUTURE_YEARS, forecast_vals, "o--",
             color=col, linewidth=1.5, markersize=5,
             label=f"{name} {'★' if name == best_model_name else ''}")
+    # 每条预测线标注数值
+    for yr, val in zip(FUTURE_YEARS, forecast_vals):
+        ax.annotate(f"${val:.1f}B", xy=(yr, val),
+                    xytext=(0, 8), textcoords="offset points",
+                    ha="center", fontsize=6, color=col)
+
 ax.set_title("Medicaid Expenditure — All Model Projections (2026–2035)", fontsize=13)
 ax.set_xlabel("Year"); ax.set_ylabel("Expenditure ($B)")
 ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.0f}B"))
@@ -315,7 +416,7 @@ plt.savefig(f"{OUT}/fig3_all_models.png", dpi=150)
 plt.close()
  
 # ── Fig 4: Best model with CI ──
-fig, ax = plt.subplots(figsize=(12, 6))
+fig, ax = plt.subplots(figsize=(14, 7))
 ax.plot(YEARS, VALUES / 1e9, "ko-", linewidth=2, markersize=8, label="Historical", zorder=5)
 ax.plot(FUTURE_YEARS, best["forecast"] / 1e9, "o-",
         color=COLOR["best"], linewidth=2.5, markersize=8,
@@ -324,6 +425,19 @@ ax.fill_between(FUTURE_YEARS,
                 best["ci_low"]  / 1e9,
                 best["ci_high"] / 1e9,
                 color=COLOR["ci"], alpha=0.5, label="95% Confidence Interval")
+
+# 历史数据标注
+for yr, val in zip(YEARS, VALUES):
+    ax.annotate(f"${val/1e9:.1f}B", xy=(yr, val/1e9),
+                xytext=(0, 10), textcoords="offset points",
+                ha="center", fontsize=7.5, color="#2B6CB0")
+
+# 预测数据标注
+for yr, val in zip(FUTURE_YEARS, best["forecast"]):
+    ax.annotate(f"${val/1e9:.1f}B", xy=(yr, val/1e9),
+                xytext=(0, 10), textcoords="offset points",
+                ha="center", fontsize=7.5, color=COLOR["best"])
+
 ax.set_title(f"Medicaid Expenditure — 10-Year Projection [{best_model_name}]", fontsize=13)
 ax.set_xlabel("Year"); ax.set_ylabel("Expenditure ($B)")
 ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.0f}B"))
@@ -374,7 +488,6 @@ print(f"Saved: {OUT}/medicaid_visualization_report.pdf")
 # ─────────────────────────────────────────────
 # 9. EXPORT INTERACTIVE HTML REPORT
 # ─────────────────────────────────────────────
-# Serialize data for JavaScript
 hist_data = list(zip(YEARS.tolist(), (VALUES / 1e9).round(2).tolist()))
 proj_data = list(zip(
     FUTURE_YEARS.tolist(),
@@ -474,7 +587,15 @@ new Chart(document.getElementById("forecastChart"),{{
       {{label:"95% CI Lower", data:ciLow, borderColor:"rgba(154,230,180,.5)", pointRadius:0, fill:false}},
     ]
   }},
-  options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:"top"}}}},scales:{{y:{{ticks:{{callback:v=>"$"+v+"B"}}}}}}}}
+  options:{{
+    responsive:true,
+    maintainAspectRatio:false,
+    plugins:{{
+      legend:{{position:"top"}},
+      datalabels: false
+    }},
+    scales:{{y:{{ticks:{{callback:v=>"$"+v+"B"}}}}}}
+  }}
 }});
  
 new Chart(document.getElementById("growthChart"),{{
